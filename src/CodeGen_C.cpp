@@ -515,6 +515,16 @@ public:
         return r;
     }
 
+    static Vec load_predicated(const void *base, const CppVector<int32_t, Lanes> &offset, const Mask &predicate) {
+        Vec r;
+        for (size_t i = 0; i < Lanes; i++) {
+            if (predicate[i]) {
+                r[i] = ((const ElementType*)base)[offset[i]];
+            }
+        }
+        return r;
+    }
+
     static void store(const Vec &v, void *base, int32_t offset) {
         memcpy(((ElementType*)base + offset), v.data(), sizeof(ElementType) * Lanes);
     }
@@ -522,6 +532,14 @@ public:
     static void store_scatter(const Vec &v, void *base, const CppVector<int32_t, Lanes> &offset) {
         for (size_t i = 0; i < Lanes; i++) {
             ((ElementType*)base)[offset[i]] = v[i];
+        }
+    }
+
+    static void store_predicated(const Vec &v, void *base, const CppVector<int32_t, Lanes> &offset, const Mask &predicate) {
+        for (size_t i = 0; i < Lanes; i++) {
+            if (predicate[i]) {
+                ((ElementType*)base)[offset[i]] = v[i];
+            }
         }
     }
 
@@ -1025,6 +1043,15 @@ public:
         return r;
     }
 
+    static Vec load_predicated(const void *base, const NativeVector<int32_t, Lanes> offset, const NativeVector<uint8_t, Lanes> predicate) {
+        Vec r;
+        for (size_t i = 0; i < Lanes; i++) {
+            if (predicate[i]) {
+                r[i] = ((const ElementType*)base)[offset[i]];
+            }
+        }
+        return r;
+    }
     static void store(const Vec v, void *base, int32_t offset) {
         // We only require Vec to be element-aligned, so we can't safely just write
         // directly from memory (might segfault). Use memcpy for safety.
@@ -1038,6 +1065,14 @@ public:
     static void store_scatter(const Vec v, void *base, const NativeVector<int32_t, Lanes> offset) {
         for (size_t i = 0; i < Lanes; i++) {
             ((ElementType*)base)[offset[i]] = v[i];
+        }
+    }
+
+    static void store_predicated(const Vec v, void *base, const NativeVector<int32_t, Lanes> offset, const NativeVector<uint8_t, Lanes> predicate) {
+        for (size_t i = 0; i < Lanes; i++) {
+            if (predicate[i]) {
+                ((ElementType*)base)[offset[i]] = v[i];
+            }
         }
     }
 
@@ -2274,7 +2309,7 @@ string CodeGen_C::print_scalarized_expr(const Expr &e) {
         Expr e2 = extract_lane(e, lane);
         string elem = print_expr(e2);
         ostringstream rhs;
-        rhs << v << ".replace(" << lane << ", " << elem << ")";
+        rhs << print_type(t) + "_ops::replace(" << v << ", " << lane << ", " << elem << ")";
         v = print_assignment(t, rhs.str());
     }
     return v;
@@ -2302,8 +2337,6 @@ string CodeGen_C::print_extern_call(const Call *op) {
 }
 
 void CodeGen_C::visit(const Load *op) {
-    user_assert(is_const_one(op->predicate)) << "Predicated load is not supported by C backend.\n";
-
     // TODO: We could replicate the logic in the llvm codegen which decides whether
     // the vector access can be aligned. Doing so would also require introducing
     // aligned type equivalents for all the vector types.
@@ -2314,7 +2347,7 @@ void CodeGen_C::visit(const Load *op) {
 
     // If we're loading a contiguous ramp into a vector, just load the vector
     Expr dense_ramp_base = strided_ramp_base(op->index, 1);
-    if (dense_ramp_base.defined()) {
+    if (dense_ramp_base.defined() && is_const_one(op->predicate)) {
         internal_assert(t.is_vector());
         string id_ramp_base = print_expr(dense_ramp_base);
         rhs << print_type(t) + "_ops::load(" << name << ", " << id_ramp_base << ")";
@@ -2322,8 +2355,15 @@ void CodeGen_C::visit(const Load *op) {
         // If index is a vector, gather vector elements.
         internal_assert(t.is_vector());
         string id_index = print_expr(op->index);
-        rhs << print_type(t) + "_ops::load_gather(" << name << ", " << id_index << ")";
+        if (is_const_one(op->predicate)) {
+            rhs << print_type(t) + "_ops::load_gather(" << name << ", " << id_index << ")";
+        } else {
+            string id_predicate = print_expr(op->predicate);
+            rhs << print_type(t) + "_ops::load_predicated(" << name << ", " << id_index << ", " << id_predicate << ")";
+        }
     } else {
+        user_assert(is_const_one(op->predicate)) << "Predicated scalar load is not supported by C backend.\n";
+
         string id_index = print_expr(op->index);
         bool type_cast_needed = !(allocations.contains(op->name) &&
                                   allocations.get(op->name).type.element_of() == t.element_of());
@@ -2339,8 +2379,6 @@ void CodeGen_C::visit(const Load *op) {
 }
 
 void CodeGen_C::visit(const Store *op) {
-    user_assert(is_const_one(op->predicate)) << "Predicated store is not supported by C backend.\n";
-
     Type t = op->value.type();
 
     if (inside_atomic_mutex_node) {
@@ -2367,7 +2405,7 @@ void CodeGen_C::visit(const Store *op) {
 
     // If we're writing a contiguous ramp, just store the vector.
     Expr dense_ramp_base = strided_ramp_base(op->index, 1);
-    if (dense_ramp_base.defined()) {
+    if (dense_ramp_base.defined() && is_const_one(op->predicate)) {
         internal_assert(op->value.type().is_vector());
         string id_ramp_base = print_expr(dense_ramp_base);
         stream << get_indent() << print_type(t) + "_ops::store(" << id_value << ", " << name << ", " << id_ramp_base << ");\n";
@@ -2375,8 +2413,15 @@ void CodeGen_C::visit(const Store *op) {
         // If index is a vector, scatter vector elements.
         internal_assert(t.is_vector());
         string id_index = print_expr(op->index);
-        stream << get_indent() << print_type(t) + "_ops::store_scatter(" << id_value << ", " << name << ", " << id_index << ");\n";
+        if (is_const_one(op->predicate)) {
+            stream << get_indent() << print_type(t) + "_ops::store_scatter(" << id_value << ", " << name << ", " << id_index << ");\n";
+        } else {
+            string id_predicate = print_expr(op->predicate);
+            stream << get_indent() << print_type(t) + "_ops::store_predicated(" << id_value << ", " << name << ", " << id_index << ", " << id_predicate << ");\n";
+        }
     } else {
+        user_assert(is_const_one(op->predicate)) << "Predicated scalar store is not supported by C backend.\n";
+
         bool type_cast_needed =
             t.is_handle() ||
             !allocations.contains(op->name) ||
@@ -2429,6 +2474,62 @@ void CodeGen_C::visit(const Select *op) {
         rhs << type << "_ops::select(" << cond << ", " << true_val << ", " << false_val << ")";
     }
     print_assignment(op->type, rhs.str());
+}
+
+Expr CodeGen_C::scalarize_vector_reduce(const VectorReduce *op) {
+    Expr (*binop)(Expr, Expr) = nullptr;
+    switch (op->op) {
+    case VectorReduce::Add:
+        binop = Add::make;
+        break;
+    case VectorReduce::Mul:
+        binop = Mul::make;
+        break;
+    case VectorReduce::Min:
+        binop = Min::make;
+        break;
+    case VectorReduce::Max:
+        binop = Max::make;
+        break;
+    case VectorReduce::And:
+        binop = And::make;
+        break;
+    case VectorReduce::Or:
+        binop = Or::make;
+        break;
+    case VectorReduce::SaturatingAdd:
+        binop = saturating_add;
+        break;
+    }
+
+    std::vector<Expr> lanes;
+    int outer_lanes = op->type.lanes();
+    int inner_lanes = op->value.type().lanes() / outer_lanes;
+    for (int outer = 0; outer < outer_lanes; outer++) {
+        Expr reduction = extract_lane(op->value, outer * inner_lanes);
+        for (int inner = 1; inner < inner_lanes; inner++) {
+            reduction = binop(reduction, extract_lane(op->value, outer * inner_lanes + inner));
+        }
+        lanes.push_back(reduction);
+    }
+
+    // No need to concat if there is only a single value.
+    if (lanes.size() == 1) {
+        return lanes[0];
+    }
+
+    return Shuffle::make_concat(lanes);
+}
+
+void CodeGen_C::visit(const VectorReduce *op) {
+    stream << get_indent() << "// Vector reduce: " << op->op << "\n";
+
+    Expr scalarized = scalarize_vector_reduce(op);
+    if (scalarized.type().is_scalar()) {
+        print_assignment(op->type, print_expr(scalarized));
+    } else {
+        print_assignment(op->type, print_scalarized_expr(scalarized));
+    }
 }
 
 void CodeGen_C::visit(const LetStmt *op) {
@@ -2612,6 +2713,7 @@ void CodeGen_C::visit(const Allocate *op) {
                 size_id = print_expr(make_const(size_id_type, constant_size));
 
                 if (op->memory_type == MemoryType::Stack ||
+                    op->memory_type == MemoryType::Register ||
                     (op->memory_type == MemoryType::Auto &&
                      can_allocation_fit_on_stack(stack_bytes))) {
                     on_stack = true;
@@ -2750,7 +2852,6 @@ void CodeGen_C::visit(const Evaluate *op) {
 
 void CodeGen_C::visit(const Shuffle *op) {
     internal_assert(!op->vectors.empty());
-    internal_assert(op->vectors[0].type().is_vector());
     for (size_t i = 1; i < op->vectors.size(); i++) {
         internal_assert(op->vectors[0].type() == op->vectors[i].type());
     }
@@ -2773,13 +2874,17 @@ void CodeGen_C::visit(const Shuffle *op) {
         for (size_t vec_idx = 0; vec_idx < op->vectors.size(); vec_idx++) {
             const int vec_lanes = op->vectors[vec_idx].type().lanes();
             if (idx < vec_lanes) {
-                rhs << vecs[vec_idx] << "[" << idx << "]";
+                rhs << vecs[vec_idx];
+                if (op->vectors[vec_idx].type().is_vector()) {
+                    rhs << "[" << idx << "]";
+                }
                 break;
             }
             idx -= vec_lanes;
         }
         internal_assert(!rhs.str().empty());
     } else {
+        internal_assert(op->vectors[0].type().is_vector());
         string src = vecs[0];
         if (op->vectors.size() > 1) {
             // This code has always assumed/required that all the vectors

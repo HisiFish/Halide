@@ -560,14 +560,14 @@ private:
     virtual void codegen_predicated_vector_load(const Load *op);
     virtual void codegen_predicated_vector_store(const Store *op);
 
-    void codegen_atomic_store(const Store *op);
+    void codegen_atomic_rmw(const Store *op);
 
     void init_codegen(const std::string &name, bool any_strict_float = false);
     std::unique_ptr<llvm::Module> finish_codegen();
 
     /** A helper routine for generating folded vector reductions. */
     template<typename Op>
-    bool try_to_fold_vector_reduce(const Op *op);
+    bool try_to_fold_vector_reduce(const Expr &a, Expr b);
 };
 
 }  // namespace Internal

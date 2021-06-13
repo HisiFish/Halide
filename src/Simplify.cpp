@@ -20,7 +20,7 @@ int Simplify::debug_indent = 0;
 #endif
 
 Simplify::Simplify(bool r, const Scope<Interval> *bi, const Scope<ModulusRemainder> *ai)
-    : remove_dead_lets(r), no_float_simplify(false) {
+    : remove_dead_code(r), no_float_simplify(false) {
 
     // Only respect the constant bounds from the containing scope.
     for (auto iter = bi->cbegin(); iter != bi->cend(); ++iter) {
@@ -149,11 +149,9 @@ void Simplify::ScopedFact::learn_false(const Expr &fact) {
                 learn_upper_bound(v, i.max - 1);
             }
         }
-    } else if (const Call *c = fact.as<Call>()) {
-        if (c->is_intrinsic(Call::likely) || c->is_intrinsic(Call::likely_if_innermost)) {
-            learn_false(c->args[0]);
-            return;
-        }
+    } else if (const Call *c = Call::as_tag(fact)) {
+        learn_false(c->args[0]);
+        return;
     } else if (const Or *o = fact.as<Or>()) {
         // Both must be false
         learn_false(o->a);
@@ -286,11 +284,9 @@ void Simplify::ScopedFact::learn_true(const Expr &fact) {
                 learn_lower_bound(v, i.min);
             }
         }
-    } else if (const Call *c = fact.as<Call>()) {
-        if (c->is_intrinsic(Call::likely) || c->is_intrinsic(Call::likely_if_innermost)) {
-            learn_true(c->args[0]);
-            return;
-        }
+    } else if (const Call *c = Call::as_tag(fact)) {
+        learn_true(c->args[0]);
+        return;
     } else if (const And *a = fact.as<And>()) {
         // Both must be true
         learn_true(a->a);
@@ -343,13 +339,23 @@ Simplify::ScopedFact::~ScopedFact() {
 Expr simplify(const Expr &e, bool remove_dead_let_stmts,
               const Scope<Interval> &bounds,
               const Scope<ModulusRemainder> &alignment) {
-    return Simplify(remove_dead_let_stmts, &bounds, &alignment).mutate(e, nullptr);
+    Simplify m(remove_dead_let_stmts, &bounds, &alignment);
+    Expr result = m.mutate(e, nullptr);
+    if (m.in_unreachable) {
+        return unreachable(e.type());
+    }
+    return result;
 }
 
 Stmt simplify(const Stmt &s, bool remove_dead_let_stmts,
               const Scope<Interval> &bounds,
               const Scope<ModulusRemainder> &alignment) {
-    return Simplify(remove_dead_let_stmts, &bounds, &alignment).mutate(s);
+    Simplify m(remove_dead_let_stmts, &bounds, &alignment);
+    Stmt result = m.mutate(s);
+    if (m.in_unreachable) {
+        return Evaluate::make(unreachable());
+    }
+    return result;
 }
 
 class SimplifyExprs : public IRMutator {
@@ -421,13 +427,7 @@ bool can_prove(Expr e, const Scope<Interval> &bounds) {
                 }
                 s[p.second] = make_const(p.first, (int)(rng() & 0xffff) - 0x7fff);
             }
-            Expr probe = simplify(substitute(s, e));
-            if (const Call *c = probe.as<Call>()) {
-                if (c->is_intrinsic(Call::likely) ||
-                    c->is_intrinsic(Call::likely_if_innermost)) {
-                    probe = c->args[0];
-                }
-            }
+            Expr probe = unwrap_tags(simplify(substitute(s, e)));
             if (!is_const_one(probe)) {
                 // Found a counter-example, or something that fails to fold
                 return false;
